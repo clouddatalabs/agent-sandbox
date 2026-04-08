@@ -1130,31 +1130,40 @@ func TestReconcilePod(t *testing.T) {
 			expectErr: true,
 		},
 		{
-			name:        "error when annotated pod does not exist",
-			initialObjs: []runtime.Object{},
-			sandbox: &sandboxv1alpha1.Sandbox{
+			name: "clears stale annotation and creates replacement pod when annotated pod does not exist",
+			sandbox: func() *sandboxv1alpha1.Sandbox {
+				s := sandboxObj.DeepCopy()
+				s.Annotations = map[string]string{
+					sandboxv1alpha1.SandboxPodNameAnnotation: "non-existent-pod",
+				}
+				return s
+			}(),
+			wantPod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      sandboxName,
-					Namespace: sandboxNs,
-					Annotations: map[string]string{
-						sandboxv1alpha1.SandboxPodNameAnnotation: "non-existent-pod",
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					ResourceVersion: "1",
+					Labels: map[string]string{
+						"agents.x-k8s.io/sandbox-name-hash": nameHash,
+						"custom-label":                      "label-val",
 					},
+					Annotations: map[string]string{
+						"custom-annotation": "anno-val",
+					},
+					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
 				},
-				Spec: sandboxv1alpha1.SandboxSpec{
-					Replicas: ptr.To(int32(1)),
-					PodTemplate: sandboxv1alpha1.PodTemplate{
-						Spec: corev1.PodSpec{
-							Containers: []corev1.Container{
-								{
-									Name: "test-container",
-								},
-							},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name: "test-container",
 						},
 					},
 				},
 			},
-			wantPod:   nil,
-			expectErr: true,
+			expectErr: false,
+			wantSandboxAnnotations: map[string]string{
+				sandboxv1alpha1.SandboxPodNameAnnotation: sandboxName,
+			},
 		},
 		{
 			name: "refuses to delete annotated pod owned by a different controller",
