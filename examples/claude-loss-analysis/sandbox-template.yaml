@@ -1,0 +1,73 @@
+# SandboxTemplate for the claude-loss-analysis flavor.
+# Runs Claude Code CLI inside an isolated K8s sandbox for eval loss analysis.
+#
+# Security:
+#   - Egress restricted to DNS + Anthropic API (api.anthropic.com) only
+#   - No access to internal services (ClickHouse, Postgres, S3, gRPC)
+#   - No access to K8s API server (default-deny egress)
+#   - ANTHROPIC_API_KEY injected from K8s secret
+#
+# Usage:
+#   kubectl apply -f sandbox-template.yaml -n agent-sandbox-system
+#
+# The image tag must be updated to match the ECR image built by the
+# build-agent-sandbox-image CI workflow in the devops-copilot repo.
+apiVersion: extensions.agents.x-k8s.io/v1alpha1
+kind: SandboxTemplate
+metadata:
+  name: claude-loss-analysis
+  namespace: agent-sandbox-system
+spec:
+  podTemplate:
+    spec:
+      containers:
+        - name: claude-loss-analysis
+          # Update image tag after building via build-agent-sandbox-image workflow
+          image: agent-sandbox-image:claude-loss-analysis-latest
+          ports:
+            - containerPort: 8888
+              protocol: TCP
+          env:
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: anthropic-api-key
+                  key: api-key
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 2000m
+              memory: 4Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8888
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+  networkPolicy:
+    # Only allow ingress from the sandbox router (svc-analysis connectivity)
+    ingress:
+      - from:
+          - podSelector:
+              matchLabels:
+                app: sandbox-router
+
+    egress:
+      # Allow DNS resolution (required for any network connectivity)
+      - ports:
+          - protocol: UDP
+            port: 53
+          - protocol: TCP
+            port: 53
+
+      # Allow Anthropic API only (api.anthropic.com)
+      # CIDR from https://platform.claude.com/docs/en/api/ip-addresses
+      - to:
+          - ipBlock:
+              cidr: 160.79.104.0/23
+        ports:
+          - protocol: TCP
+            port: 443
