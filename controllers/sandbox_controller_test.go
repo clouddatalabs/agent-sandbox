@@ -1158,7 +1158,9 @@ func TestReconcilePod(t *testing.T) {
 						"custom-label":                      "label-val",
 					},
 					Annotations: map[string]string{
-						"custom-annotation": "anno-val",
+						"custom-annotation":                      "anno-val",
+						"agents.x-k8s.io/propagated-labels":      "custom-label",
+						"agents.x-k8s.io/propagated-annotations": "custom-annotation",
 					},
 					OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
 				},

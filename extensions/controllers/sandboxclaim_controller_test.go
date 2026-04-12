@@ -494,6 +494,189 @@ func TestSandboxClaimReconcile(t *testing.T) {
 			},
 		},
 		{
+			name: "claim labels and annotations propagate to all volumeClaimTemplates",
+			claimToReconcile: &extensionsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "claim-vct-meta", Namespace: "default", UID: "uid-vct-meta"},
+				Spec: extensionsv1alpha1.SandboxClaimSpec{
+					TemplateRef: extensionsv1alpha1.SandboxTemplateRef{Name: "test-template-multi-vct"},
+					AdditionalPodMetadata: sandboxv1alpha1.PodMetadata{
+						Labels: map[string]string{
+							"billing/team": "platform",
+						},
+						Annotations: map[string]string{
+							"resolve.ai/org-id":    "test-org",
+							"resolve.ai/canvas-id": "test-canvas",
+						},
+					},
+				},
+			},
+			existingObjects: []client.Object{
+				&extensionsv1alpha1.SandboxTemplate{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-template-multi-vct", Namespace: "default"},
+					Spec: extensionsv1alpha1.SandboxTemplateSpec{
+						PodTemplate: sandboxv1alpha1.PodTemplate{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{Name: "test-container", Image: "test-image"}},
+							},
+						},
+						VolumeClaimTemplates: []sandboxv1alpha1.PersistentVolumeClaimTemplate{
+							{
+								EmbeddedObjectMetadata: sandboxv1alpha1.EmbeddedObjectMetadata{
+									Name: "workspace",
+									Annotations: map[string]string{
+										"csi.driver/mode": "isolated-rw",
+									},
+								},
+								Spec: corev1.PersistentVolumeClaimSpec{
+									AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+									Resources: corev1.VolumeResourceRequirements{
+										Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+									},
+								},
+							},
+							{
+								EmbeddedObjectMetadata: sandboxv1alpha1.EmbeddedObjectMetadata{
+									Name: "cache",
+								},
+								Spec: corev1.PersistentVolumeClaimSpec{
+									AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+									Resources: corev1.VolumeResourceRequirements{
+										Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("5Gi")},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectSandbox: true,
+			expectedCondition: metav1.Condition{
+				Type: string(sandboxv1alpha1.SandboxConditionReady), Status: metav1.ConditionFalse, Reason: "SandboxNotReady", Message: "Sandbox is not ready",
+			},
+			validateSandbox: func(t *testing.T, sandbox *sandboxv1alpha1.Sandbox, _ *extensionsv1alpha1.SandboxTemplate) {
+				if len(sandbox.Spec.VolumeClaimTemplates) != 2 {
+					t.Fatalf("expected 2 VolumeClaimTemplates, got %d", len(sandbox.Spec.VolumeClaimTemplates))
+				}
+				for _, vct := range sandbox.Spec.VolumeClaimTemplates {
+					// Annotations propagated to both VCTs
+					if val, ok := vct.Annotations["resolve.ai/org-id"]; !ok || val != "test-org" {
+						t.Errorf("VCT %q: expected annotation resolve.ai/org-id=test-org, got %q", vct.Name, val)
+					}
+					if val, ok := vct.Annotations["resolve.ai/canvas-id"]; !ok || val != "test-canvas" {
+						t.Errorf("VCT %q: expected annotation resolve.ai/canvas-id=test-canvas, got %q", vct.Name, val)
+					}
+					// Labels propagated to both VCTs
+					if val, ok := vct.Labels["billing/team"]; !ok || val != "platform" {
+						t.Errorf("VCT %q: expected label billing/team=platform, got %q", vct.Name, val)
+					}
+				}
+				// Pre-existing template annotation preserved on first VCT
+				if val, ok := sandbox.Spec.VolumeClaimTemplates[0].Annotations["csi.driver/mode"]; !ok || val != "isolated-rw" {
+					t.Errorf("expected pre-existing annotation csi.driver/mode=isolated-rw preserved, got %q", val)
+				}
+				// Pod metadata also propagated
+				if val, ok := sandbox.Spec.PodTemplate.ObjectMeta.Annotations["resolve.ai/org-id"]; !ok || val != "test-org" {
+					t.Errorf("expected pod annotation resolve.ai/org-id=test-org, got %q", val)
+				}
+			},
+		},
+		{
+			name: "VCT annotation conflict with template is rejected",
+			claimToReconcile: &extensionsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "claim-vct-conflict", Namespace: "default", UID: "uid-vct-conflict"},
+				Spec: extensionsv1alpha1.SandboxClaimSpec{
+					TemplateRef: extensionsv1alpha1.SandboxTemplateRef{Name: "test-template-vct-conflict"},
+					AdditionalPodMetadata: sandboxv1alpha1.PodMetadata{
+						Annotations: map[string]string{
+							"csi.driver/mode": "read-only",
+						},
+					},
+				},
+			},
+			existingObjects: []client.Object{
+				&extensionsv1alpha1.SandboxTemplate{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-template-vct-conflict", Namespace: "default"},
+					Spec: extensionsv1alpha1.SandboxTemplateSpec{
+						PodTemplate: sandboxv1alpha1.PodTemplate{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{Name: "test-container", Image: "test-image"}},
+							},
+						},
+						VolumeClaimTemplates: []sandboxv1alpha1.PersistentVolumeClaimTemplate{
+							{
+								EmbeddedObjectMetadata: sandboxv1alpha1.EmbeddedObjectMetadata{
+									Name: "workspace",
+									Annotations: map[string]string{
+										"csi.driver/mode": "isolated-rw",
+									},
+								},
+								Spec: corev1.PersistentVolumeClaimSpec{
+									AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+									Resources: corev1.VolumeResourceRequirements{
+										Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectSandbox: false,
+			expectError:   true,
+			expectedCondition: metav1.Condition{
+				Type: string(sandboxv1alpha1.SandboxConditionReady), Status: metav1.ConditionFalse, Reason: "ReconcilerError",
+			},
+		},
+		{
+			name: "volumeClaimTemplates without additionalPodMetadata have no extra annotations",
+			claimToReconcile: &extensionsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "claim-vct-no-meta", Namespace: "default", UID: "uid-vct-no-meta"},
+				Spec: extensionsv1alpha1.SandboxClaimSpec{
+					TemplateRef: extensionsv1alpha1.SandboxTemplateRef{Name: "test-template-with-vct-plain"},
+				},
+			},
+			existingObjects: []client.Object{
+				&extensionsv1alpha1.SandboxTemplate{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-template-with-vct-plain", Namespace: "default"},
+					Spec: extensionsv1alpha1.SandboxTemplateSpec{
+						PodTemplate: sandboxv1alpha1.PodTemplate{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{Name: "test-container", Image: "test-image"}},
+							},
+						},
+						VolumeClaimTemplates: []sandboxv1alpha1.PersistentVolumeClaimTemplate{
+							{
+								EmbeddedObjectMetadata: sandboxv1alpha1.EmbeddedObjectMetadata{
+									Name: "workspace",
+								},
+								Spec: corev1.PersistentVolumeClaimSpec{
+									AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+									Resources: corev1.VolumeResourceRequirements{
+										Requests: corev1.ResourceList{
+											corev1.ResourceStorage: resource.MustParse("10Gi"),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectSandbox: true,
+			expectedCondition: metav1.Condition{
+				Type: string(sandboxv1alpha1.SandboxConditionReady), Status: metav1.ConditionFalse, Reason: "SandboxNotReady", Message: "Sandbox is not ready",
+			},
+			validateSandbox: func(t *testing.T, sandbox *sandboxv1alpha1.Sandbox, _ *extensionsv1alpha1.SandboxTemplate) {
+				if len(sandbox.Spec.VolumeClaimTemplates) != 1 {
+					t.Fatalf("expected 1 VolumeClaimTemplate, got %d", len(sandbox.Spec.VolumeClaimTemplates))
+				}
+				vct := sandbox.Spec.VolumeClaimTemplates[0]
+				if len(vct.Annotations) != 0 {
+					t.Errorf("expected no annotations on VolumeClaimTemplate, got %v", vct.Annotations)
+				}
+			},
+		},
+		{
 			name: "claim with restricted domain label is rejected",
 			claimToReconcile: &extensionsv1alpha1.SandboxClaim{
 				ObjectMeta: metav1.ObjectMeta{Name: "claim-restricted-label", Namespace: "default", UID: "uid-restricted-label"},

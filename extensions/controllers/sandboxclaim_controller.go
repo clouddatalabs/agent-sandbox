@@ -540,6 +540,15 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 			return nil, err
 		}
 
+		// Propagate claim metadata to VolumeClaimTemplates (for CSI drivers that
+		// read PVC annotations, e.g. S3 Files subPathPattern). Note: for warm pool
+		// sandboxes the PVCs are already provisioned, so annotations added here only
+		// take effect if the PVC hasn't been created yet or the CSI driver supports
+		// late-binding annotation reads.
+		if err := propagateMetadataToVolumeClaimTemplates(adopted.Spec.VolumeClaimTemplates, &claim.Spec.AdditionalPodMetadata); err != nil {
+			return nil, err
+		}
+
 		// Update uses optimistic concurrency (resourceVersion) so concurrent
 		// claims racing to adopt the same sandbox will conflict and retry.
 		if err := r.Update(ctx, adopted); err != nil {
@@ -674,6 +683,51 @@ func mergePodMetadata(templateMeta *v1alpha1.PodMetadata, claimMeta *v1alpha1.Po
 	return nil
 }
 
+// propagateMetadataToVolumeClaimTemplates merges labels and annotations from
+// claimMeta into each VolumeClaimTemplate. Mirrors the conflict-checking and
+// restricted-domain validation of mergePodMetadata.
+func propagateMetadataToVolumeClaimTemplates(
+	vcts []v1alpha1.PersistentVolumeClaimTemplate,
+	claimMeta *v1alpha1.PodMetadata,
+) error {
+	if claimMeta == nil || (len(claimMeta.Labels) == 0 && len(claimMeta.Annotations) == 0) {
+		return nil
+	}
+
+	for i := range vcts {
+		// Labels
+		for k, v := range claimMeta.Labels {
+			if tv, ok := vcts[i].Labels[k]; ok && tv != v {
+				return fmt.Errorf("VolumeClaimTemplate %q: label %q is defined in template with value %q, but claim requests %q", vcts[i].Name, k, tv, v)
+			}
+		}
+		if len(claimMeta.Labels) > 0 {
+			if vcts[i].Labels == nil {
+				vcts[i].Labels = make(map[string]string)
+			}
+			for k, v := range claimMeta.Labels {
+				vcts[i].Labels[k] = v
+			}
+		}
+
+		// Annotations
+		for k, v := range claimMeta.Annotations {
+			if tv, ok := vcts[i].Annotations[k]; ok && tv != v {
+				return fmt.Errorf("VolumeClaimTemplate %q: annotation %q is defined in template with value %q, but claim requests %q", vcts[i].Name, k, tv, v)
+			}
+		}
+		if len(claimMeta.Annotations) > 0 {
+			if vcts[i].Annotations == nil {
+				vcts[i].Annotations = make(map[string]string)
+			}
+			for k, v := range claimMeta.Annotations {
+				vcts[i].Annotations[k] = v
+			}
+		}
+	}
+	return nil
+}
+
 func (r *SandboxClaimReconciler) createSandbox(ctx context.Context, claim *extensionsv1alpha1.SandboxClaim, template *extensionsv1alpha1.SandboxTemplate) (*v1alpha1.Sandbox, error) {
 	logger := log.FromContext(ctx)
 
@@ -712,6 +766,12 @@ func (r *SandboxClaimReconciler) createSandbox(ctx context.Context, claim *exten
 	sandbox.Spec.PodTemplate.ObjectMeta.Labels[sandboxTemplateRefHash] = sandboxcontrollers.NameHash(template.Name)
 
 	if err := mergePodMetadata(&sandbox.Spec.PodTemplate.ObjectMeta, &claim.Spec.AdditionalPodMetadata); err != nil {
+		return nil, err
+	}
+
+	// Propagate claim's additionalPodMetadata to VolumeClaimTemplates so CSI
+	// drivers (e.g. S3 Files isolated-rw) can resolve subPathPattern from PVC annotations.
+	if err := propagateMetadataToVolumeClaimTemplates(sandbox.Spec.VolumeClaimTemplates, &claim.Spec.AdditionalPodMetadata); err != nil {
 		return nil, err
 	}
 
