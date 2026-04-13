@@ -703,6 +703,8 @@ func (r *SandboxClaimReconciler) createSandbox(ctx context.Context, claim *exten
 
 	template.Spec.PodTemplate.DeepCopyInto(&sandbox.Spec.PodTemplate)
 
+	CopyVolumeClaimTemplates(template, &sandbox.Spec)
+
 	if sandbox.Spec.PodTemplate.ObjectMeta.Labels == nil {
 		sandbox.Spec.PodTemplate.ObjectMeta.Labels = make(map[string]string)
 	}

@@ -16,8 +16,20 @@ package controllers
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
 )
+
+// CopyVolumeClaimTemplates deep-copies VolumeClaimTemplates from a SandboxTemplate into a Sandbox.
+func CopyVolumeClaimTemplates(template *extensionsv1alpha1.SandboxTemplate, sandbox *sandboxv1alpha1.SandboxSpec) {
+	if len(template.Spec.VolumeClaimTemplates) == 0 {
+		return
+	}
+	sandbox.VolumeClaimTemplates = make([]sandboxv1alpha1.PersistentVolumeClaimTemplate, len(template.Spec.VolumeClaimTemplates))
+	for i, vct := range template.Spec.VolumeClaimTemplates {
+		vct.DeepCopyInto(&sandbox.VolumeClaimTemplates[i])
+	}
+}
 
 // ApplySandboxSecureDefaults applies the controller's "Secure by Default" logic to a PodSpec.
 func ApplySandboxSecureDefaults(template *extensionsv1alpha1.SandboxTemplate, spec *corev1.PodSpec) {

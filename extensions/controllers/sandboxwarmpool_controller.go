@@ -360,7 +360,7 @@ func (r *SandboxWarmPoolReconciler) createPoolSandbox(ctx context.Context, warmP
 		},
 	}
 
-	// Apply secure defaults to the sandbox pod spec
+	CopyVolumeClaimTemplates(template, &sandbox.Spec)
 	ApplySandboxSecureDefaults(template, &sandbox.Spec.PodTemplate.Spec)
 
 	// Set controller reference so the Sandbox is owned by the SandboxWarmPool
