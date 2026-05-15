@@ -56,6 +56,9 @@ var ErrTemplateNotFound = errors.New("SandboxTemplate not found")
 // ErrInvalidMetadata is a sentinel error indicating additionalPodMetadata was invalid.
 var ErrInvalidMetadata = errors.New("invalid additionalPodMetadata")
 
+// ErrInvalidSharedSandboxMounts is a sentinel error indicating shared sandbox mounts were invalid.
+var ErrInvalidSharedSandboxMounts = errors.New("invalid shared sandbox mounts")
+
 var restrictedDomains = []string{"kubernetes.io", "k8s.io", "agents.x-k8s.io"}
 
 // getWarmPoolPolicy returns the effective warm pool policy for a claim.
@@ -205,7 +208,7 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// Suppress expected user errors (like missing templates) to avoid crash loops
-	if errors.Is(reconcileErr, ErrTemplateNotFound) || errors.Is(reconcileErr, ErrInvalidMetadata) {
+	if errors.Is(reconcileErr, ErrTemplateNotFound) || errors.Is(reconcileErr, ErrInvalidMetadata) || errors.Is(reconcileErr, ErrInvalidSharedSandboxMounts) {
 		logger.V(1).Info("Sandboxclaim suppressed error(s) encountered", "error", reconcileErr, "request", req.NamespacedName)
 		return result, nil
 	}
@@ -240,8 +243,13 @@ func (r *SandboxClaimReconciler) reconcileActive(ctx context.Context, claim *ext
 		return nil, fmt.Errorf("%w: %w", ErrInvalidMetadata, err)
 	}
 
+	sharedSandboxMounts, err := parseSharedSandboxMountsAnnotation(claim)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidSharedSandboxMounts, err)
+	}
+
 	// Fast path: try to find existing or adopt from warm pool before template lookup.
-	sandbox, err := r.getOrCreateSandbox(ctx, claim, nil)
+	sandbox, err := r.getOrCreateSandbox(ctx, claim, sharedSandboxMounts)
 	logger.V(1).Info("getOrCreateSandbox result", "sandboxFound", sandbox != nil, "err", err, "claim", claim.Name)
 	if err != nil {
 		return nil, err
@@ -306,7 +314,7 @@ func (r *SandboxClaimReconciler) reconcileActive(ctx context.Context, claim *ext
 		return nil, fmt.Errorf("failed to reconcile network policy: %w", npErr)
 	}
 
-	return r.createSandbox(ctx, claim, template)
+	return r.createSandbox(ctx, claim, template, sharedSandboxMounts)
 }
 
 // reconcileExpired ensures the Sandbox is deleted for Retained claims.
@@ -377,6 +385,16 @@ func (r *SandboxClaimReconciler) computeReadyCondition(claim *extensionsv1alpha1
 		}
 		if errors.Is(err, ErrInvalidMetadata) {
 			reason = "InvalidMetadata"
+			return metav1.Condition{
+				Type:               string(v1alpha1.SandboxConditionReady),
+				Status:             metav1.ConditionFalse,
+				Reason:             reason,
+				Message:            err.Error(),
+				ObservedGeneration: claim.Generation,
+			}
+		}
+		if errors.Is(err, ErrInvalidSharedSandboxMounts) {
+			reason = "InvalidSharedSandboxMounts"
 			return metav1.Condition{
 				Type:               string(v1alpha1.SandboxConditionReady),
 				Status:             metav1.ConditionFalse,
@@ -728,7 +746,7 @@ func propagateMetadataToVolumeClaimTemplates(
 	return nil
 }
 
-func (r *SandboxClaimReconciler) createSandbox(ctx context.Context, claim *extensionsv1alpha1.SandboxClaim, template *extensionsv1alpha1.SandboxTemplate) (*v1alpha1.Sandbox, error) {
+func (r *SandboxClaimReconciler) createSandbox(ctx context.Context, claim *extensionsv1alpha1.SandboxClaim, template *extensionsv1alpha1.SandboxTemplate, sharedSandboxMounts []sharedSandboxMount) (*v1alpha1.Sandbox, error) {
 	logger := log.FromContext(ctx)
 
 	if template == nil {
@@ -758,6 +776,10 @@ func (r *SandboxClaimReconciler) createSandbox(ctx context.Context, claim *exten
 	template.Spec.PodTemplate.DeepCopyInto(&sandbox.Spec.PodTemplate)
 
 	CopyVolumeClaimTemplates(template, &sandbox.Spec)
+
+	if err := applySharedSandboxMountsToSandboxSpec(&sandbox.Spec, sharedSandboxMounts); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidSharedSandboxMounts, err)
+	}
 
 	if sandbox.Spec.PodTemplate.ObjectMeta.Labels == nil {
 		sandbox.Spec.PodTemplate.ObjectMeta.Labels = make(map[string]string)
@@ -805,7 +827,7 @@ func (r *SandboxClaimReconciler) createSandbox(ctx context.Context, claim *exten
 	return sandbox, nil
 }
 
-func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *extensionsv1alpha1.SandboxClaim, _ *extensionsv1alpha1.SandboxTemplate) (*v1alpha1.Sandbox, error) {
+func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *extensionsv1alpha1.SandboxClaim, sharedSandboxMounts []sharedSandboxMount) (*v1alpha1.Sandbox, error) {
 	logger := log.FromContext(ctx)
 	logger.V(1).Info("Executing getOrCreateSandbox", "claim", claim.Name)
 
@@ -861,6 +883,11 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 		} else if !k8errors.IsNotFound(err) {
 			return nil, fmt.Errorf("strong read for existing sandbox failed: %w", err)
 		}
+	}
+
+	if len(sharedSandboxMounts) > 0 {
+		logger.Info("Skipping warm pool adoption because shared sandbox mounts require a newly created pod", "claim", claim.Name)
+		return nil, nil
 	}
 
 	// Single List: ownership guard + adoption candidate scan.
