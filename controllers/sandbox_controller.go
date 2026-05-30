@@ -17,6 +17,7 @@ package controllers
 import (
 	"context"
 	"errors"
+	"k8s.io/client-go/util/retry"
 	"fmt"
 	"hash/fnv"
 	"maps"
@@ -317,9 +318,18 @@ func (r *SandboxReconciler) updateStatus(ctx context.Context, oldStatus *sandbox
 	if reflect.DeepEqual(oldStatus, &sandbox.Status) {
 		return nil
 	}
-
-	if err := r.Status().Update(ctx, sandbox); err != nil {
-		log.Error(err, "Failed to update sandbox status")
+	// Use RetryOnConflict to handle optimistic concurrency conflicts that occur
+	// when the sandbox object was patched earlier in the same reconcile loop
+	// (e.g., by ensurePodNameAnnotation or updatePodMetadata).
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		// Re-fetch the latest sandbox version before updating status
+		if fetchErr := r.Get(ctx, client.ObjectKeyFromObject(sandbox), sandbox); fetchErr != nil {
+			return fetchErr
+		}
+		return r.Status().Update(ctx, sandbox)
+	})
+	if err != nil {
+		log.Error(err, "Failed to update sandbox status after retries")
 		return err
 	}
 
