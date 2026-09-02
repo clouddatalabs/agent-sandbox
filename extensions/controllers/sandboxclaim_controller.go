@@ -49,6 +49,11 @@ import (
 
 const ObservabilityAnnotation = "agents.x-k8s.io/controller-first-observed-at"
 
+// FirstReadyRecordedAnnotation marks a claim whose startup latency has been recorded. A claim's
+// Ready condition can flip False and back True later in its life (pod restart, node NotReady);
+// without this marker every such flap would re-record the claim's age as a "startup" latency.
+const FirstReadyRecordedAnnotation = "agents.x-k8s.io/first-ready-recorded-at"
+
 // ErrTemplateNotFound is a sentinel error indicating a SandboxTemplate was not found.
 var ErrTemplateNotFound = errors.New("SandboxTemplate not found")
 
@@ -1088,6 +1093,13 @@ func (r *SandboxClaimReconciler) recordCreationLatencyMetric(
 		return
 	}
 
+	// Only the first Ready transition in a claim's life is a startup. The marker is persisted
+	// on the object so a later NotReady -> Ready flap (or a controller restart between the two)
+	// cannot re-record the claim's age as startup latency.
+	if claim.Annotations[FirstReadyRecordedAnnotation] != "" {
+		return
+	}
+
 	launchType := asmetrics.LaunchTypeCold
 	// This is unlikely to happen; here for completeness only.
 	if sandbox == nil {
@@ -1122,16 +1134,33 @@ func (r *SandboxClaimReconciler) recordCreationLatencyMetric(
 	}
 
 	// For cold launches, also record the time from Sandbox creation to Ready state to capture controller overhead.
-	if sandbox == nil || sandbox.CreationTimestamp.IsZero() {
+	if sandbox != nil && !sandbox.CreationTimestamp.IsZero() {
+		sandboxReady := meta.FindStatusCondition(sandbox.Status.Conditions, string(v1alpha1.SandboxConditionReady))
+		if sandboxReady != nil && sandboxReady.Status == metav1.ConditionTrue && !sandboxReady.LastTransitionTime.IsZero() {
+			latency := sandboxReady.LastTransitionTime.Sub(sandbox.CreationTimestamp.Time)
+			if latency >= 0 {
+				asmetrics.RecordSandboxCreationLatency(latency, sandbox.Namespace, launchType, claim.Spec.TemplateRef.Name)
+			}
+		}
+	}
+
+	r.markFirstReadyRecorded(ctx, claim)
+}
+
+// markFirstReadyRecorded persists the first-ready marker. A failed patch is logged, not
+// returned: the metrics are already recorded, and the worst case is one duplicate observation
+// on a later flap, which is what happened on every flap before the marker existed.
+func (r *SandboxClaimReconciler) markFirstReadyRecorded(ctx context.Context, claim *extensionsv1alpha1.SandboxClaim) {
+	if r.Client == nil {
 		return
 	}
-	sandboxReady := meta.FindStatusCondition(sandbox.Status.Conditions, string(v1alpha1.SandboxConditionReady))
-	if sandboxReady == nil || sandboxReady.Status != metav1.ConditionTrue || sandboxReady.LastTransitionTime.IsZero() {
-		return
+	patch := client.MergeFrom(claim.DeepCopy())
+	if claim.Annotations == nil {
+		claim.Annotations = make(map[string]string)
 	}
-	latency := sandboxReady.LastTransitionTime.Sub(sandbox.CreationTimestamp.Time)
-	if latency >= 0 {
-		asmetrics.RecordSandboxCreationLatency(latency, sandbox.Namespace, launchType, claim.Spec.TemplateRef.Name)
+	claim.Annotations[FirstReadyRecordedAnnotation] = time.Now().Format(time.RFC3339Nano)
+	if err := r.Patch(ctx, claim, patch); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to persist first-ready marker on SandboxClaim", "claim", claim.Name)
 	}
 }
 

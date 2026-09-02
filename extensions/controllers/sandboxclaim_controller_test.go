@@ -24,7 +24,9 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	k8errors "k8s.io/apimachinery/pkg/api/errors"
@@ -2250,6 +2252,68 @@ func TestSandboxClaimPredicates(t *testing.T) {
 			t.Error("expected the entry to be removed on delete")
 		}
 	})
+}
+
+func TestRecordCreationLatencyMetricRecordsOnlyFirstReady(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	claim := &extensionsv1alpha1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "once-claim", Namespace: "default", UID: types.UID("uid-once"),
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: extensionsv1alpha1.SandboxClaimSpec{
+			TemplateRef: extensionsv1alpha1.SandboxTemplateRef{Name: "tmpl-once"},
+		},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(claim).Build()
+	r := &SandboxClaimReconciler{Client: k8sClient, Scheme: scheme}
+
+	ready := metav1.Condition{
+		Type: string(sandboxv1alpha1.SandboxConditionReady), Status: metav1.ConditionTrue,
+		Reason: "DependenciesReady", LastTransitionTime: metav1.Now(),
+	}
+	notReady := ready
+	notReady.Status = metav1.ConditionFalse
+	wasNotReady := &extensionsv1alpha1.SandboxClaimStatus{Conditions: []metav1.Condition{notReady}}
+	claim.Status.Conditions = []metav1.Condition{ready}
+
+	// No sandbox is passed, so launch_type resolves to "unknown".
+	sampleCount := func() uint64 {
+		m := &dto.Metric{}
+		observer := asmetrics.ClaimStartupLatency.WithLabelValues(asmetrics.LaunchTypeUnknown, "tmpl-once")
+		metric, ok := observer.(prometheus.Metric)
+		if !ok {
+			t.Fatal("histogram child does not implement prometheus.Metric")
+		}
+		if err := metric.Write(m); err != nil {
+			t.Fatal(err)
+		}
+		return m.GetHistogram().GetSampleCount()
+	}
+
+	before := sampleCount()
+	r.recordCreationLatencyMetric(ctx, claim, wasNotReady, nil)
+	if got := sampleCount() - before; got != 1 {
+		t.Fatalf("expected the first Ready transition to record one observation, got %d", got)
+	}
+	if claim.Annotations[FirstReadyRecordedAnnotation] == "" {
+		t.Fatal("expected the first-ready marker on the in-memory claim")
+	}
+
+	stored := &extensionsv1alpha1.SandboxClaim{}
+	if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(claim), stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Annotations[FirstReadyRecordedAnnotation] == "" {
+		t.Fatal("expected the first-ready marker to be persisted")
+	}
+
+	// A later NotReady -> Ready flap on the same claim must not record again.
+	r.recordCreationLatencyMetric(ctx, stored, wasNotReady, nil)
+	if got := sampleCount() - before; got != 1 {
+		t.Errorf("expected a Ready flap to record nothing, histogram grew by %d", got)
+	}
 }
 
 func TestRecordClaimDeletionOutcome(t *testing.T) {
