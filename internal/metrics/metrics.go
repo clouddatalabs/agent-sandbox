@@ -37,8 +37,9 @@ var (
 		prometheus.HistogramOpts{
 			Name: "agent_sandbox_claim_startup_latency_ms",
 			Help: "End-to-end latency from SandboxClaim creation to Sandbox Ready state in milliseconds.",
-			// Buckets for latency from 100ms to 4 minutes
-			Buckets: []float64{100, 250, 500, 750, 1000, 1250, 1500, 2000, 2500, 5000, 10000, 30000, 60000, 120000, 240000},
+			// Buckets for latency from 100ms to 30 minutes. The top finite bucket must exceed every
+			// client-side create budget (10 min) or histogram_quantile pins saturated percentiles to it.
+			Buckets: []float64{100, 250, 500, 750, 1000, 1250, 1500, 2000, 2500, 5000, 10000, 20000, 30000, 45000, 60000, 90000, 120000, 240000, 300000, 600000, 900000, 1800000},
 		},
 		[]string{"launch_type", "sandbox_template"},
 	)
@@ -51,8 +52,9 @@ var (
 		prometheus.HistogramOpts{
 			Name: "agent_sandbox_claim_controller_startup_latency_ms",
 			Help: "Latency from controller first observed SandboxClaim to Sandbox Ready state in milliseconds.",
-			// Buckets for latency from 100ms to 4 minutes
-			Buckets: []float64{100, 250, 500, 750, 1000, 1250, 1500, 2000, 2500, 5000, 10000, 30000, 60000, 120000, 240000},
+			// Buckets for latency from 100ms to 30 minutes. The top finite bucket must exceed every
+			// client-side create budget (10 min) or histogram_quantile pins saturated percentiles to it.
+			Buckets: []float64{100, 250, 500, 750, 1000, 1250, 1500, 2000, 2500, 5000, 10000, 20000, 30000, 45000, 60000, 90000, 120000, 240000, 300000, 600000, 900000, 1800000},
 		},
 		[]string{"launch_type", "sandbox_template"},
 	)
@@ -66,8 +68,8 @@ var (
 		prometheus.HistogramOpts{
 			Name: "agent_sandbox_creation_latency_ms",
 			Help: "Latency from Sandbox creation to Pod Ready state in milliseconds. For warm launches, this measures controller synchronization overhead since the Pod is pre-provisioned.",
-			// Buckets for latency from 50ms to 10 minutes
-			Buckets: []float64{50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000, 120000, 240000, 300000, 600000},
+			// Buckets for latency from 50ms to 30 minutes
+			Buckets: []float64{50, 100, 250, 500, 1000, 2500, 5000, 10000, 20000, 30000, 45000, 60000, 90000, 120000, 240000, 300000, 600000, 900000, 1800000},
 		},
 		[]string{"namespace", "launch_type", "sandbox_template"},
 	)
@@ -85,6 +87,28 @@ var (
 			Help: "Total number of SandboxClaims created, labeled by namespace, sandbox template, launch type, warmpool name, and pod condition.",
 		},
 		[]string{"namespace", "sandbox_template", "launch_type", "warmpool_name", "pod_condition"},
+	)
+
+	// SandboxClaimDeletedBeforeReadyTotal counts SandboxClaims deleted without ever reaching
+	// the Ready state and without expiring. This is the controller-side view of startup
+	// timeouts: the sandbox client deletes a claim whose pod never became healthy within its
+	// create budget, and a deliberate mid-create terminate looks the same. Expired claims are
+	// excluded (expiry rewrites the Ready condition before deletion, and an expired claim did
+	// start — it ended its lifetime). Known imprecision: a claim whose Ready condition is
+	// transiently False at deletion time (e.g. a pod restarting right then) is counted even
+	// though it started successfully earlier; treat the metric as a startup-failure rate, not
+	// an exact count. Timeout percentage:
+	//   increase(agent_sandbox_claim_deleted_before_ready_total[1h])
+	//     / increase(agent_sandbox_claim_creation_total[1h])
+	// Labels:
+	// - namespace: the namespace of the claim
+	// - sandbox_template: the SandboxTemplateRef
+	SandboxClaimDeletedBeforeReadyTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agent_sandbox_claim_deleted_before_ready_total",
+			Help: "Total number of SandboxClaims deleted before ever reaching Ready (excluding expired claims) — startup timeouts and mid-create terminations.",
+		},
+		[]string{"namespace", "sandbox_template"},
 	)
 
 	// AgentSandboxesDesc describes the agent_sandboxes metric point-in-time counts.
@@ -108,6 +132,7 @@ func init() {
 	metrics.Registry.MustRegister(ClaimControllerStartupLatency)
 	metrics.Registry.MustRegister(SandboxCreationLatency)
 	metrics.Registry.MustRegister(SandboxClaimCreationTotal)
+	metrics.Registry.MustRegister(SandboxClaimDeletedBeforeReadyTotal)
 }
 
 // RecordClaimStartupLatency records the duration since the provided start time.
@@ -130,4 +155,9 @@ func RecordSandboxCreationLatency(duration time.Duration, namespace, launchType,
 // RecordSandboxClaimCreation increments the total count of created sandbox claims.
 func RecordSandboxClaimCreation(namespace, templateName, launchType, warmPoolName, podCondition string) {
 	SandboxClaimCreationTotal.WithLabelValues(namespace, templateName, launchType, warmPoolName, podCondition).Inc()
+}
+
+// RecordSandboxClaimDeletedBeforeReady increments the count of claims deleted before Ready.
+func RecordSandboxClaimDeletedBeforeReady(namespace, templateName string) {
+	SandboxClaimDeletedBeforeReadyTotal.WithLabelValues(namespace, templateName).Inc()
 }

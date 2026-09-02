@@ -30,7 +30,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -120,13 +119,12 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			claim.Annotations = make(map[string]string)
 		}
 		if needObservabilityPatch {
-			key := types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}
-			if val, ok := r.observedTimes.Load(key); ok {
+			if val, ok := r.observedTimes.Load(claim.UID); ok {
 				claim.Annotations[ObservabilityAnnotation] = val.(time.Time).Format(time.RFC3339Nano)
 			} else {
 				now := time.Now()
 				claim.Annotations[ObservabilityAnnotation] = now.Format(time.RFC3339Nano)
-				r.observedTimes.Store(key, now)
+				r.observedTimes.Store(claim.UID, now)
 			}
 		}
 		if needTraceContextPatch {
@@ -955,19 +953,44 @@ func (r *SandboxClaimReconciler) getTemplate(ctx context.Context, claim *extensi
 	return template, nil
 }
 
+// getTimingPredicate records when the controller first sees a claim. Entries are keyed by
+// UID, not name: claim names are deterministic and reused across a canvas's successive
+// sandboxes, and a name-keyed entry that survived the previous claim would be stamped onto
+// the next one as its "first observed" time (RES: controller latency panel pinned at the
+// histogram ceiling). Only Create events populate the map; Delete events drop the entry so
+// the map cannot grow without bound.
 func (r *SandboxClaimReconciler) getTimingPredicate() predicate.Funcs {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
-			key := types.NamespacedName{Name: e.Object.GetName(), Namespace: e.Object.GetNamespace()}
-			r.observedTimes.LoadOrStore(key, time.Now())
+			r.observedTimes.LoadOrStore(e.Object.GetUID(), time.Now())
 			return true
 		},
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			key := types.NamespacedName{Name: e.ObjectNew.GetName(), Namespace: e.ObjectNew.GetNamespace()}
-			r.observedTimes.LoadOrStore(key, time.Now())
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			r.observedTimes.Delete(e.Object.GetUID())
+			if claim, ok := e.Object.(*extensionsv1alpha1.SandboxClaim); ok {
+				recordClaimDeletionOutcome(claim)
+			}
 			return true
 		},
 	}
+}
+
+// recordClaimDeletionOutcome counts claims that are deleted before ever reaching Ready.
+// Expired claims are skipped: expiry clears status and rewrites the Ready condition before
+// the delete, and an expired claim started successfully — it simply ended its lifetime.
+// What remains is the startup-failure population: claims the client tore down because the
+// sandbox never became healthy within its create budget, plus deliberate mid-create
+// terminations. See the metric comment in internal/metrics/metrics.go for the known
+// imprecision around transiently-NotReady claims.
+func recordClaimDeletionOutcome(claim *extensionsv1alpha1.SandboxClaim) {
+	if hasExpiredCondition(claim.Status.Conditions) {
+		return
+	}
+	ready := meta.FindStatusCondition(claim.Status.Conditions, string(v1alpha1.SandboxConditionReady))
+	if ready != nil && ready.Status == metav1.ConditionTrue {
+		return
+	}
+	asmetrics.RecordSandboxClaimDeletedBeforeReady(claim.Namespace, claim.Spec.TemplateRef.Name)
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -1069,8 +1092,10 @@ func (r *SandboxClaimReconciler) recordCreationLatencyMetric(
 	// This is unlikely to happen; here for completeness only.
 	if sandbox == nil {
 		launchType = asmetrics.LaunchTypeUnknown
-	} else if sandbox.Annotations[v1alpha1.SandboxPodNameAnnotation] != "" {
-		// Existence of the SandboxPodNameAnnotation implies the pod was adopted from a warm pool.
+	} else if claim.Spec.WarmPool != nil && *claim.Spec.WarmPool != "" && *claim.Spec.WarmPool != extensionsv1alpha1.WarmPoolPolicyNone && sandbox.Annotations[v1alpha1.SandboxPodNameAnnotation] != "" {
+		// Only a claim that asked for a warm pool can have adopted a pre-provisioned pod. The
+		// pod-name annotation is no longer a warm-pool marker: this fork stamps it on every
+		// sandbox (ensurePodNameAnnotation), which labelled every cold launch "warm".
 		launchType = asmetrics.LaunchTypeWarm
 	}
 
@@ -1092,7 +1117,7 @@ func (r *SandboxClaimReconciler) recordCreationLatencyMetric(
 		} else {
 			asmetrics.RecordClaimControllerStartupLatency(observedTime, launchType, claim.Spec.TemplateRef.Name)
 			// Clean up map entry after success
-			r.observedTimes.Delete(types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace})
+			r.observedTimes.Delete(claim.UID)
 		}
 	}
 
