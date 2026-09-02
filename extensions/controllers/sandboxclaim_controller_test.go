@@ -24,7 +24,9 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	k8errors "k8s.io/apimachinery/pkg/api/errors"
@@ -37,7 +39,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
@@ -2193,46 +2194,180 @@ func TestSandboxClaimPredicates(t *testing.T) {
 	r := &SandboxClaimReconciler{}
 	pred := r.getTimingPredicate()
 
-	testCases := []struct {
-		name        string
-		trigger     func(p predicate.Predicate) bool
-		expectedKey types.NamespacedName
-	}{
-		{
-			name: "CreateFunc stores time",
-			trigger: func(p predicate.Predicate) bool {
-				return p.Create(event.CreateEvent{
-					Object: &extensionsv1alpha1.SandboxClaim{
-						ObjectMeta: metav1.ObjectMeta{Name: "test-claim", Namespace: "default"},
-					},
-				})
-			},
-			expectedKey: types.NamespacedName{Name: "test-claim", Namespace: "default"},
-		},
-		{
-			name: "UpdateFunc stores time",
-			trigger: func(p predicate.Predicate) bool {
-				return p.Update(event.UpdateEvent{
-					ObjectNew: &extensionsv1alpha1.SandboxClaim{
-						ObjectMeta: metav1.ObjectMeta{Name: "test-claim-update", Namespace: "default"},
-					},
-				})
-			},
-			expectedKey: types.NamespacedName{Name: "test-claim-update", Namespace: "default"},
-		},
+	newClaim := func(name, uid string) *extensionsv1alpha1.SandboxClaim {
+		return &extensionsv1alpha1.SandboxClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", UID: types.UID(uid)},
+		}
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			r.observedTimes = sync.Map{} // Reset map for each test case
-			res := tc.trigger(pred)
-			if !res {
-				t.Error("expected predicate to return true")
-			}
+	t.Run("CreateFunc stores time keyed by UID", func(t *testing.T) {
+		r.observedTimes = sync.Map{}
+		c := newClaim("test-claim", "uid-1")
+		if !pred.Create(event.CreateEvent{Object: c}) {
+			t.Error("expected predicate to return true")
+		}
+		if _, ok := r.observedTimes.Load(c.UID); !ok {
+			t.Errorf("expected time to be stored in observedTimes map for UID %v", c.UID)
+		}
+	})
 
-			if _, ok := r.observedTimes.Load(tc.expectedKey); !ok {
-				t.Errorf("expected time to be stored in observedTimes map for key %v", tc.expectedKey)
-			}
-		})
+	t.Run("UpdateFunc does not populate the map", func(t *testing.T) {
+		r.observedTimes = sync.Map{}
+		c := newClaim("test-claim-update", "uid-2")
+		if !pred.Update(event.UpdateEvent{ObjectNew: c}) {
+			t.Error("expected predicate to return true")
+		}
+		if _, ok := r.observedTimes.Load(c.UID); ok {
+			t.Error("update events must not create observedTimes entries")
+		}
+	})
+
+	// Regression: claim names are deterministic and reused across a canvas's successive
+	// sandboxes. A name-keyed map handed the previous claim's timestamp to the next claim,
+	// which pinned the controller-latency histogram at its top bucket. Keying by UID means
+	// a recreated claim always starts its own clock.
+	t.Run("a reused name with a new UID gets a fresh timestamp", func(t *testing.T) {
+		r.observedTimes = sync.Map{}
+		stale := newClaim("test-claim", "uid-old")
+		r.observedTimes.Store(stale.UID, time.Now().Add(-time.Hour))
+		fresh := newClaim("test-claim", "uid-new")
+		pred.Create(event.CreateEvent{Object: fresh})
+		v, ok := r.observedTimes.Load(fresh.UID)
+		if !ok {
+			t.Fatal("expected an entry for the new UID")
+		}
+		if time.Since(v.(time.Time)) > time.Minute {
+			t.Error("new claim inherited a stale timestamp")
+		}
+	})
+
+	t.Run("DeleteFunc removes the entry", func(t *testing.T) {
+		r.observedTimes = sync.Map{}
+		c := newClaim("test-claim", "uid-3")
+		pred.Create(event.CreateEvent{Object: c})
+		if !pred.Delete(event.DeleteEvent{Object: c}) {
+			t.Error("expected predicate to return true")
+		}
+		if _, ok := r.observedTimes.Load(c.UID); ok {
+			t.Error("expected the entry to be removed on delete")
+		}
+	})
+}
+
+func TestRecordCreationLatencyMetricRecordsOnlyFirstReady(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	claim := &extensionsv1alpha1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "once-claim", Namespace: "default", UID: types.UID("uid-once"),
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: extensionsv1alpha1.SandboxClaimSpec{
+			TemplateRef: extensionsv1alpha1.SandboxTemplateRef{Name: "tmpl-once"},
+		},
 	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(claim).Build()
+	r := &SandboxClaimReconciler{Client: k8sClient, Scheme: scheme}
+
+	ready := metav1.Condition{
+		Type: string(sandboxv1alpha1.SandboxConditionReady), Status: metav1.ConditionTrue,
+		Reason: "DependenciesReady", LastTransitionTime: metav1.Now(),
+	}
+	notReady := ready
+	notReady.Status = metav1.ConditionFalse
+	wasNotReady := &extensionsv1alpha1.SandboxClaimStatus{Conditions: []metav1.Condition{notReady}}
+	claim.Status.Conditions = []metav1.Condition{ready}
+
+	// No sandbox is passed, so launch_type resolves to "unknown".
+	sampleCount := func() uint64 {
+		m := &dto.Metric{}
+		observer := asmetrics.ClaimStartupLatency.WithLabelValues(asmetrics.LaunchTypeUnknown, "tmpl-once")
+		metric, ok := observer.(prometheus.Metric)
+		if !ok {
+			t.Fatal("histogram child does not implement prometheus.Metric")
+		}
+		if err := metric.Write(m); err != nil {
+			t.Fatal(err)
+		}
+		return m.GetHistogram().GetSampleCount()
+	}
+
+	before := sampleCount()
+	r.recordCreationLatencyMetric(ctx, claim, wasNotReady, nil)
+	if got := sampleCount() - before; got != 1 {
+		t.Fatalf("expected the first Ready transition to record one observation, got %d", got)
+	}
+	if claim.Annotations[FirstReadyRecordedAnnotation] == "" {
+		t.Fatal("expected the first-ready marker on the in-memory claim")
+	}
+
+	stored := &extensionsv1alpha1.SandboxClaim{}
+	if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(claim), stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Annotations[FirstReadyRecordedAnnotation] == "" {
+		t.Fatal("expected the first-ready marker to be persisted")
+	}
+
+	// A later NotReady -> Ready flap on the same claim must not record again.
+	r.recordCreationLatencyMetric(ctx, stored, wasNotReady, nil)
+	if got := sampleCount() - before; got != 1 {
+		t.Errorf("expected a Ready flap to record nothing, histogram grew by %d", got)
+	}
+}
+
+func TestRecordClaimDeletionOutcome(t *testing.T) {
+	counter := func(templateName string) float64 {
+		return testutil.ToFloat64(asmetrics.SandboxClaimDeletedBeforeReadyTotal.WithLabelValues("default", templateName))
+	}
+	newClaim := func(templateName string, conditions []metav1.Condition) *extensionsv1alpha1.SandboxClaim {
+		c := &extensionsv1alpha1.SandboxClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-claim", Namespace: "default"},
+			Spec: extensionsv1alpha1.SandboxClaimSpec{
+				TemplateRef: extensionsv1alpha1.SandboxTemplateRef{Name: templateName},
+			},
+		}
+		c.Status.Conditions = conditions
+		return c
+	}
+	readyCond := func(status metav1.ConditionStatus, reason string) metav1.Condition {
+		return metav1.Condition{
+			Type:               string(sandboxv1alpha1.SandboxConditionReady),
+			Status:             status,
+			Reason:             reason,
+			LastTransitionTime: metav1.Now(),
+		}
+	}
+
+	t.Run("counts a claim deleted before Ready", func(t *testing.T) {
+		before := counter("tmpl-never-ready")
+		recordClaimDeletionOutcome(newClaim("tmpl-never-ready", nil))
+		if got := counter("tmpl-never-ready") - before; got != 1 {
+			t.Errorf("expected counter to increase by 1, got %v", got)
+		}
+	})
+
+	t.Run("counts a claim whose Ready condition is False", func(t *testing.T) {
+		before := counter("tmpl-not-ready")
+		recordClaimDeletionOutcome(newClaim("tmpl-not-ready", []metav1.Condition{readyCond(metav1.ConditionFalse, "DependenciesNotReady")}))
+		if got := counter("tmpl-not-ready") - before; got != 1 {
+			t.Errorf("expected counter to increase by 1, got %v", got)
+		}
+	})
+
+	t.Run("skips a Ready claim", func(t *testing.T) {
+		before := counter("tmpl-ready")
+		recordClaimDeletionOutcome(newClaim("tmpl-ready", []metav1.Condition{readyCond(metav1.ConditionTrue, "DependenciesReady")}))
+		if got := counter("tmpl-ready") - before; got != 0 {
+			t.Errorf("expected counter to stay unchanged, got +%v", got)
+		}
+	})
+
+	t.Run("skips an expired claim", func(t *testing.T) {
+		before := counter("tmpl-expired")
+		recordClaimDeletionOutcome(newClaim("tmpl-expired", []metav1.Condition{readyCond(metav1.ConditionFalse, extensionsv1alpha1.ClaimExpiredReason)}))
+		if got := counter("tmpl-expired") - before; got != 0 {
+			t.Errorf("expected counter to stay unchanged, got +%v", got)
+		}
+	})
 }
