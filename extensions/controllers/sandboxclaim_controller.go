@@ -137,6 +137,8 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}
 
+	// Snapshot for the status merge patch (see updateStatus).
+	claimBefore := claim.DeepCopy()
 	originalClaimStatus := claim.Status.DeepCopy()
 
 	// Check Expiration
@@ -181,6 +183,15 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		sandbox, reconcileErr = r.reconcileActive(ctx, claim)
 	}
 
+	// A conflict means another writer beat us to the Sandbox (its own controller writing
+	// status) or the claim (the client extending its lifetime): our read is stale, so
+	// neither the status we would compute nor the failure backoff is warranted. Requeue
+	// immediately and reconcile from a fresh read.
+	if k8errors.IsConflict(reconcileErr) {
+		logger.V(1).Info("Conflict while reconciling SandboxClaim; requeueing", "request", req.NamespacedName)
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	// Update Status & Events
 	r.computeAndSetStatus(claim, sandbox, reconcileErr, claimExpired)
 
@@ -190,7 +201,11 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}
 
-	if updateErr := r.updateStatus(ctx, originalClaimStatus, claim); updateErr != nil {
+	if updateErr := r.updateStatus(ctx, claimBefore, claim); updateErr != nil {
+		if k8errors.IsConflict(updateErr) {
+			logger.V(1).Info("Conflict while writing SandboxClaim status; requeueing", "request", req.NamespacedName)
+			return ctrl.Result{Requeue: true}, nil
+		}
 		errs := errors.Join(reconcileErr, updateErr)
 		logger.V(1).Info("Sandboxclaim UpdateStatus error encountered", "errors", errs, "request", req.NamespacedName)
 		return ctrl.Result{}, errs
@@ -282,8 +297,12 @@ func (r *SandboxClaimReconciler) reconcileActive(ctx context.Context, claim *ext
 
 			if !equality.Semantic.DeepEqual(&mergedMeta, &sandbox.Spec.PodTemplate.ObjectMeta) {
 				logger.Info("Updating sandbox metadata to match claim", "claim", claim.Name, "sandbox", sandbox.Name)
+				// Merge patch so this spec sync cannot 409 against the Sandbox controller's
+				// concurrent status writes; a MergeFrom diff also carries removed keys as
+				// nulls, so the result still matches the claim exactly as the Update did.
+				sandboxBefore := sandbox.DeepCopy()
 				sandbox.Spec.PodTemplate.ObjectMeta = mergedMeta
-				if err := r.Update(ctx, sandbox); err != nil {
+				if err := r.Patch(ctx, sandbox, client.MergeFrom(sandboxBefore)); err != nil {
 					return nil, err
 				}
 			}
@@ -334,9 +353,14 @@ func (r *SandboxClaimReconciler) reconcileExpired(ctx context.Context, claim *ex
 	return sandbox, nil
 }
 
-func (r *SandboxClaimReconciler) updateStatus(ctx context.Context, oldStatus *extensionsv1alpha1.SandboxClaimStatus, claim *extensionsv1alpha1.SandboxClaim) error {
+// updateStatus writes the claim status as a merge patch against the object as it was
+// read (`original`), for the same reason as SandboxReconciler.updateStatus: an Update
+// carries the read's resourceVersion and conflicts with the client's lifetime PATCHes
+// and with our own earlier annotation patch.
+func (r *SandboxClaimReconciler) updateStatus(ctx context.Context, original *extensionsv1alpha1.SandboxClaim, claim *extensionsv1alpha1.SandboxClaim) error {
 	logger := log.FromContext(ctx)
 
+	oldStatus := original.Status.DeepCopy()
 	slices.SortFunc(oldStatus.Conditions, func(a, b metav1.Condition) int {
 		if a.Type < b.Type {
 			return -1
@@ -354,8 +378,8 @@ func (r *SandboxClaimReconciler) updateStatus(ctx context.Context, oldStatus *ex
 		return nil
 	}
 
-	if err := r.Status().Update(ctx, claim); err != nil {
-		logger.Error(err, "Failed to update sandboxclaim status")
+	if err := r.Status().Patch(ctx, claim, client.MergeFrom(original)); err != nil {
+		logger.Error(err, "Failed to patch sandboxclaim status")
 		return err
 	}
 

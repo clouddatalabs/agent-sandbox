@@ -177,7 +177,8 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		sandbox.Spec.Replicas = ptr.To[int32](1)
 	}
 
-	oldStatus := sandbox.Status.DeepCopy()
+	// Snapshot for the status merge patch and the "did status change" check.
+	original := sandbox.DeepCopy()
 	var err error
 	sandboxDeleted := false
 
@@ -191,10 +192,22 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		err = r.reconcileChildResources(ctx, sandbox)
 	}
 
+	// A write conflict means another writer (the claim controller syncing spec, kubelet
+	// updating the pod) got there first: the object we read is stale, so the status we
+	// computed from it is not worth writing, and returning the conflict as an error would
+	// push the item through the exponential failure backoff. Requeue immediately and
+	// reconcile from a fresh read instead.
+	if k8serrors.IsConflict(err) {
+		log.V(1).Info("Conflict while reconciling sandbox; requeueing", "error", err.Error())
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	if !sandboxDeleted {
-		// Update status
-		if statusUpdateErr := r.updateStatus(ctx, oldStatus, sandbox); statusUpdateErr != nil {
-			// Surface update error
+		if statusUpdateErr := r.updateStatus(ctx, original, sandbox); statusUpdateErr != nil {
+			if k8serrors.IsConflict(statusUpdateErr) {
+				log.V(1).Info("Conflict while writing sandbox status; requeueing", "error", statusUpdateErr.Error())
+				return ctrl.Result{Requeue: true}, nil
+			}
 			err = errors.Join(err, statusUpdateErr)
 		}
 	}
@@ -311,19 +324,24 @@ func podIPsFromStatus(podIPs []corev1.PodIP) []string {
 	return ips
 }
 
-func (r *SandboxReconciler) updateStatus(ctx context.Context, oldStatus *sandboxv1alpha1.SandboxStatus, sandbox *sandboxv1alpha1.Sandbox) error {
+// updateStatus writes the status as a merge patch against the object as it was read
+// (`original`). An Update would carry that read's resourceVersion and fail with 409
+// whenever any other writer touched the object in between — the claim controller syncing
+// spec, kubelet updating the owned pod — which is what made Ready arrive 30-60 s late
+// behind the failure backoff. The patch sends only the status fields this controller
+// owns, so concurrent writers no longer collide.
+func (r *SandboxReconciler) updateStatus(ctx context.Context, original *sandboxv1alpha1.Sandbox, sandbox *sandboxv1alpha1.Sandbox) error {
 	log := log.FromContext(ctx)
 
-	if reflect.DeepEqual(oldStatus, &sandbox.Status) {
+	if reflect.DeepEqual(&original.Status, &sandbox.Status) {
 		return nil
 	}
 
-	if err := r.Status().Update(ctx, sandbox); err != nil {
-		log.Error(err, "Failed to update sandbox status")
+	if err := r.Status().Patch(ctx, sandbox, client.MergeFrom(original)); err != nil {
+		log.Error(err, "Failed to patch sandbox status")
 		return err
 	}
 
-	// Surface error
 	return nil
 }
 
@@ -559,6 +577,9 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 			})
 		}
 
+		// Snapshot before any mutation so the metadata write below can be a merge patch.
+		podBefore := pod.DeepCopy()
+
 		ownership, controllerRef := checkOwnership(pod, sandbox)
 		switch ownership {
 		case resourceOwnedByOther:
@@ -589,8 +610,11 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 
 		updated := r.updatePodMetadata(pod, sandbox, nameHash)
 		if updated {
-			if err := r.Update(ctx, pod); err != nil {
-				return nil, fmt.Errorf("failed to update pod: %w", err)
+			// Merge patch, not Update: this runs on every pod event, including the ones
+			// kubelet generates while it is itself patching the pod's status during
+			// startup, so a full-object Update raced kubelet and lost with 409.
+			if err := r.Patch(ctx, pod, client.MergeFrom(podBefore)); err != nil {
+				return nil, fmt.Errorf("failed to patch pod metadata: %w", err)
 			}
 		}
 

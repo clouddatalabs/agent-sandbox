@@ -15,6 +15,7 @@
 package controllers
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -27,11 +28,13 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
@@ -2043,4 +2046,39 @@ func TestSetServiceStatusCustomDomain(t *testing.T) {
 			require.Equal(t, tc.wantFQDN, sandbox.Status.ServiceFQDN)
 		})
 	}
+}
+
+// A write conflict is another writer getting there first, not a failure of this
+// reconcile: the item must come straight back (Requeue) rather than through the
+// exponential failure backoff, and the stale status must not be written.
+func TestReconcileRequeuesImmediatelyOnConflict(t *testing.T) {
+	sandbox := &sandboxv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "sb-conflict", Namespace: "default", UID: sandboxUID},
+	}
+	conflict := k8serrors.NewConflict(
+		schema.GroupResource{Group: "agents.x-k8s.io", Resource: "sandboxes"}, sandbox.Name, errors.New("stale read"),
+	)
+	statusPatches := 0
+	c := fake.NewClientBuilder().
+		WithScheme(Scheme).
+		WithStatusSubresource(&sandboxv1alpha1.Sandbox{}).
+		WithRuntimeObjects(sandbox).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourcePatch: func(_ context.Context, _ client.Client, _ string, _ client.Object, _ client.Patch, _ ...client.SubResourcePatchOption) error {
+				statusPatches++
+				return conflict
+			},
+		}).
+		Build()
+	r := &SandboxReconciler{Client: c, Scheme: Scheme, Tracer: asmetrics.NewNoOp(), ClusterDomain: "cluster.local"}
+
+	res, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: sandbox.Name, Namespace: sandbox.Namespace}})
+	require.NoError(t, err, "a conflict must not surface as a reconcile error")
+	require.True(t, res.Requeue, "a conflict must requeue immediately")
+	require.Equal(t, 1, statusPatches, "status is written as a patch, exactly once per reconcile")
+
+	// Child resources were still created before the status write collided.
+	pods := &corev1.PodList{}
+	require.NoError(t, c.List(t.Context(), pods, client.InNamespace(sandbox.Namespace)))
+	require.Len(t, pods.Items, 1)
 }
