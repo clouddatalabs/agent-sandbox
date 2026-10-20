@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -562,6 +563,19 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 		ownership, controllerRef := checkOwnership(pod, sandbox)
 		switch ownership {
 		case resourceOwnedByOther:
+			if isOwnedByPreviousSandboxWithSameName(controllerRef, sandbox) {
+				// A same-name Sandbox was deleted and recreated, but its pod is still
+				// present (for example stuck terminating on a node whose runtime cannot
+				// kill it). Refusing it forever would keep the new Sandbox from ever
+				// becoming Ready, so delete the stale pod and requeue to create a
+				// replacement.
+				if err := r.deleteStalePreviousSandboxPod(ctx, pod, controllerRef); err != nil {
+					return nil, err
+				}
+				return nil, fmt.Errorf("pod %q belonged to previous sandbox %q (UID: %s); deleting it and requeueing to create a replacement for sandbox UID %s",
+					pod.Name, controllerRef.Name, controllerRef.UID, sandbox.UID)
+			}
+
 			log.Info("Refusing to adopt pod: pod is owned by a different controller",
 				"Pod.Name", pod.Name, "Sandbox.Name", sandbox.Name,
 				"Owner.Kind", controllerRef.Kind, "Owner.Name", controllerRef.Name, "Owner.UID", controllerRef.UID)
@@ -671,6 +685,52 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 	}
 
 	return pod, nil
+}
+
+// isOwnedByPreviousSandboxWithSameName reports whether controllerRef points to an
+// earlier Sandbox that had the same name as sandbox but a different UID. Only one
+// Sandbox with a given name can exist in a namespace, so such an owner has been
+// deleted and the resource it controlled is stale.
+func isOwnedByPreviousSandboxWithSameName(controllerRef *metav1.OwnerReference, sandbox *sandboxv1alpha1.Sandbox) bool {
+	if controllerRef == nil || controllerRef.Kind != "Sandbox" || controllerRef.Name != sandbox.Name || controllerRef.UID == sandbox.UID {
+		return false
+	}
+	gv, err := schema.ParseGroupVersion(controllerRef.APIVersion)
+	if err != nil {
+		return false
+	}
+	return gv.Group == sandboxv1alpha1.GroupVersion.Group
+}
+
+// deleteStalePreviousSandboxPod deletes a pod left behind by a previous Sandbox with
+// the same name. A pod that is not yet terminating is deleted normally. A pod that is
+// already terminating and past its deletion deadline (for example because the node
+// runtime cannot kill it) is force-deleted so the name can be reused.
+func (r *SandboxReconciler) deleteStalePreviousSandboxPod(ctx context.Context, pod *corev1.Pod, controllerRef *metav1.OwnerReference) error {
+	logger := log.FromContext(ctx)
+
+	opts := []client.DeleteOption{client.Preconditions{UID: ptr.To(pod.UID)}}
+	if pod.DeletionTimestamp.IsZero() {
+		logger.Info("Deleting stale pod owned by a previous sandbox with the same name",
+			"Pod.Name", pod.Name, "Owner.Name", controllerRef.Name, "Owner.UID", controllerRef.UID)
+	} else {
+		if time.Now().Before(pod.DeletionTimestamp.Time) {
+			logger.Info("Stale pod owned by a previous sandbox is still within its termination grace period",
+				"Pod.Name", pod.Name, "Owner.Name", controllerRef.Name, "Owner.UID", controllerRef.UID,
+				"DeletionTimestamp", pod.DeletionTimestamp.Time)
+			return nil
+		}
+		logger.Info("Force-deleting stale pod owned by a previous sandbox that is stuck terminating",
+			"Pod.Name", pod.Name, "Pod.NodeName", pod.Spec.NodeName, "Owner.Name", controllerRef.Name, "Owner.UID", controllerRef.UID,
+			"DeletionTimestamp", pod.DeletionTimestamp.Time)
+		opts = append(opts, client.GracePeriodSeconds(0))
+	}
+
+	if err := r.Delete(ctx, pod, opts...); err != nil && !k8serrors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete stale pod %q owned by previous sandbox %q (UID: %s): %w",
+			pod.Name, controllerRef.Name, controllerRef.UID, err)
+	}
+	return nil
 }
 
 func (r *SandboxReconciler) updatePodMetadata(pod *corev1.Pod, sandbox *sandboxv1alpha1.Sandbox, nameHash string) bool {
