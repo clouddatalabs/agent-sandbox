@@ -891,6 +891,142 @@ func TestReconcile(t *testing.T) {
 	}
 }
 
+func TestReconcilePodStalePodFromPreviousSandbox(t *testing.T) {
+	sandboxName := "sandbox-name"
+	sandboxNs := "sandbox-ns"
+	nameHash := "name-hash"
+	newSandbox := func() *sandboxv1alpha1.Sandbox {
+		return &sandboxv1alpha1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      sandboxName,
+				Namespace: sandboxNs,
+				UID:       sandboxUID,
+			},
+			Spec: sandboxv1alpha1.SandboxSpec{
+				Replicas: ptr.To(int32(1)),
+				PodTemplate: sandboxv1alpha1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "test-container"}},
+					},
+				},
+			},
+		}
+	}
+	ownerRef := func(name string, uid types.UID) metav1.OwnerReference {
+		return metav1.OwnerReference{
+			APIVersion:         "agents.x-k8s.io/v1alpha1",
+			Kind:               "Sandbox",
+			Name:               name,
+			UID:                uid,
+			Controller:         ptr.To(true),
+			BlockOwnerDeletion: ptr.To(true),
+		}
+	}
+
+	testCases := []struct {
+		name            string
+		pod             *corev1.Pod
+		wantPodSurvives bool
+	}{
+		{
+			name: "deletes pod owned by a previous sandbox with the same name",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					UID:             "stale-pod-uid",
+					ResourceVersion: "1",
+					Labels:          map[string]string{sandboxLabel: nameHash},
+					OwnerReferences: []metav1.OwnerReference{ownerRef(sandboxName, "previous-sandbox-uid")},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c"}}},
+			},
+			wantPodSurvives: false,
+		},
+		{
+			name: "waits for terminating pod of a previous sandbox that is still within its grace period",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              sandboxName,
+					Namespace:         sandboxNs,
+					UID:               "stale-pod-uid",
+					ResourceVersion:   "1",
+					Labels:            map[string]string{sandboxLabel: nameHash},
+					OwnerReferences:   []metav1.OwnerReference{ownerRef(sandboxName, "previous-sandbox-uid")},
+					DeletionTimestamp: ptr.To(metav1.NewTime(time.Now().Add(time.Hour))),
+					Finalizers:        []string{"test/finalizer"},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c"}}},
+			},
+			wantPodSurvives: true,
+		},
+		{
+			name: "refuses pod owned by a sandbox with a different name",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            sandboxName,
+					Namespace:       sandboxNs,
+					UID:             "other-pod-uid",
+					ResourceVersion: "1",
+					Labels:          map[string]string{sandboxLabel: nameHash},
+					OwnerReferences: []metav1.OwnerReference{ownerRef("other-sandbox", "other-sandbox-uid")},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c"}}},
+			},
+			wantPodSurvives: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			sandbox := newSandbox()
+			r := SandboxReconciler{
+				Client:        newFakeClient(tc.pod.DeepCopy(), sandbox),
+				Scheme:        Scheme,
+				Tracer:        asmetrics.NewNoOp(),
+				ClusterDomain: "cluster.local",
+			}
+
+			pod, err := r.reconcilePod(t.Context(), sandbox, nameHash)
+			// The new sandbox never adopts the stale pod; the reconcile always errors so it is requeued.
+			require.Error(t, err)
+			require.Nil(t, pod)
+
+			livePod := &corev1.Pod{}
+			err = r.Get(t.Context(), types.NamespacedName{Name: tc.pod.Name, Namespace: sandboxNs}, livePod)
+			if tc.wantPodSurvives {
+				require.NoError(t, err, "expected pod %q to survive", tc.pod.Name)
+				require.Equal(t, tc.pod.UID, livePod.UID)
+			} else {
+				require.True(t, k8serrors.IsNotFound(err), "expected stale pod %q to be deleted, got err=%v", tc.pod.Name, err)
+			}
+		})
+	}
+}
+
+func TestIsOwnedByPreviousSandboxWithSameName(t *testing.T) {
+	sandbox := &sandboxv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "sb", Namespace: "ns", UID: sandboxUID},
+	}
+	testCases := []struct {
+		name string
+		ref  *metav1.OwnerReference
+		want bool
+	}{
+		{name: "nil ref", ref: nil, want: false},
+		{name: "same name, different UID", ref: &metav1.OwnerReference{APIVersion: "agents.x-k8s.io/v1alpha1", Kind: "Sandbox", Name: "sb", UID: "old-uid"}, want: true},
+		{name: "same name, same UID", ref: &metav1.OwnerReference{APIVersion: "agents.x-k8s.io/v1alpha1", Kind: "Sandbox", Name: "sb", UID: sandboxUID}, want: false},
+		{name: "different name", ref: &metav1.OwnerReference{APIVersion: "agents.x-k8s.io/v1alpha1", Kind: "Sandbox", Name: "other", UID: "old-uid"}, want: false},
+		{name: "different kind", ref: &metav1.OwnerReference{APIVersion: "apps/v1", Kind: "Deployment", Name: "sb", UID: "old-uid"}, want: false},
+		{name: "different group", ref: &metav1.OwnerReference{APIVersion: "example.com/v1", Kind: "Sandbox", Name: "sb", UID: "old-uid"}, want: false},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, isOwnedByPreviousSandboxWithSameName(tc.ref, sandbox))
+		})
+	}
+}
+
 func TestReconcilePod(t *testing.T) {
 	sandboxName := "sandbox-name"
 	sandboxNs := "sandbox-ns"
